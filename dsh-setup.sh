@@ -1,128 +1,197 @@
-bash -c "$(cat <<'INSTALL_DSH'
 #!/usr/bin/env bash
-set -Eeuo pipefail
+# DeepSeek Harness launcher for Android (Termux + proot Debian/Ubuntu)
+#
+# Usage (inside Termux):
+#   bash dsh-android.sh          # install what's missing, start server, open browser
+#   bash dsh-android.sh stop     # stop the server
+#   bash dsh-android.sh logs     # show server log
+#
+# Advanced (already inside a Debian/Ubuntu shell):
+#   bash dsh-android.sh --inside-setup && bash dsh-android.sh --inside-serve
+#
+# Env overrides: DISTRO=debian|ubuntu  NODE_MAJOR=22  MIN_NODE_MAJOR=20
+#                PKG_NAME=@deepseek-ai/dsh  WAIT_SECS=180
 
-C_RESET='\033[0m'
-C_RED='\033[1;31m'
-C_GREEN='\033[1;32m'
-C_YELLOW='\033[1;33m'
-C_CYAN='\033[1;36m'
+set -euo pipefail
 
-info()  { printf "${C_CYAN}[INFO]${C_RESET} %s\n" "$*"; }
-ok()    { printf "${C_GREEN}[OK]${C_RESET} %s\n" "$*"; }
-warn()  { printf "${C_YELLOW}[WARN]${C_RESET} %s\n" "$*"; }
-fail()  { printf "${C_RED}[ERROR]${C_RESET} %s\n" "$*" >&2; exit 1; }
+DISTRO="${DISTRO:-debian}"
+NODE_MAJOR="${NODE_MAJOR:-22}"
+MIN_NODE_MAJOR="${MIN_NODE_MAJOR:-20}"
+PKG_NAME="${PKG_NAME:-@deepseek-ai/dsh}"
+WAIT_SECS="${WAIT_SECS:-180}"
 
-[ -n "${TERMUX_VERSION:-}" ] || fail "Run this inside Termux. Use the F-Droid build."
-command -v pkg >/dev/null 2>&1 || fail "pkg not found. Use Termux from F-Droid."
+HOST_LOG="${HOME}/dsh-server.log"
+HOST_PID="${HOME}/dsh-server.pid"
 
-SDK="$(getprop ro.build.version.sdk 2>/dev/null || echo 0)"
-if [ "${SDK:-0}" -lt 30 ]; then
-  warn "Android API ${SDK:-0} detected. Android 11 / API 30 or newer is recommended."
-fi
+log()  { printf '\033[1;36m[dsh]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[dsh] %s\033[0m\n' "$*" >&2; }
+die()  { printf '\033[1;31m[dsh] %s\033[0m\n' "$*" >&2; exit 1; }
 
-info "Updating Termux packages..."
-pkg update -y
-pkg upgrade -y
+# ----------------------------------------------------------------------------
+# Inside the Debian/Ubuntu guest
+# ----------------------------------------------------------------------------
+inner_setup() {
+  [ "$(id -u)" -eq 0 ] || die "Run as root inside the distro."
+  export DEBIAN_FRONTEND=noninteractive
 
-info "Installing system dependencies..."
-pkg install -y nodejs-lts git curl wget build-essential clang cmake ninja python pkg-config binutils libvips libandroid-spawn proot which termux-tools || {
-  warn "nodejs-lts was not available. Falling back to nodejs..."
-  pkg install -y nodejs git curl wget build-essential clang cmake ninja python pkg-config binutils libvips libandroid-spawn proot which termux-tools
+  local need_apt=0 c
+  for c in curl git make g++ python3 xz; do
+    command -v "$c" >/dev/null 2>&1 || need_apt=1
+  done
+  [ -f /etc/ssl/certs/ca-certificates.crt ] || need_apt=1
+  if [ "$need_apt" = 1 ]; then
+    log "Installing base packages..."
+    apt-get update
+    apt-get install -y --no-install-recommends \
+      curl ca-certificates git build-essential python3 xz-utils gnupg
+  fi
+
+  local node_major=0
+  if command -v node >/dev/null 2>&1; then
+    node_major="$(node -p 'process.versions.node.split(".")[0]')"
+  fi
+  if [ "$node_major" -lt "$MIN_NODE_MAJOR" ]; then
+    log "Installing Node.js ${NODE_MAJOR}.x (found: ${node_major})..."
+    local tmp
+    tmp="$(mktemp)"
+    curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" -o "$tmp"
+    bash "$tmp"
+    rm -f "$tmp"
+    apt-get install -y nodejs
+  else
+    log "Node.js $(node -v) OK"
+  fi
+
+  if ! command -v pnpm >/dev/null 2>&1; then
+    log "Installing pnpm..."
+    if ! { corepack enable && corepack prepare pnpm@latest --activate; } >/dev/null 2>&1; then
+      npm install -g pnpm
+    fi
+  fi
+  log "pnpm $(pnpm -v) OK"
 }
 
-command -v node >/dev/null 2>&1 || fail "Node.js installation failed."
-command -v npm  >/dev/null 2>&1 || fail "npm installation failed."
+inner_serve() {
+  export HOME=/root
+  cd /root
+  log "Starting DeepSeek Harness (${PKG_NAME})..."
+  exec npx -y "$PKG_NAME" web --no-open
+}
 
-info "Configuring npm..."
-npm config set fund false
-npm config set audit false
-npm config set ignore-scripts false
+# ----------------------------------------------------------------------------
+# Termux host side
+# ----------------------------------------------------------------------------
+find_url() {
+  sed 's/\x1b\[[0-9;]*[A-Za-z]//g' "$HOST_LOG" 2>/dev/null \
+    | grep -oE 'https?://(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1?\]):[0-9]+[^[:space:]]*' \
+    | head -1 \
+    | sed -e 's#//0\.0\.0\.0#//localhost#' -e 's#//\[::1\]#//localhost#' -e 's#//\[::\]#//localhost#' \
+    || true
+}
 
-if ! curl -sSf --max-time 10 https://registry.npmjs.org/ >/dev/null 2>&1; then
-  warn "npm registry is slow or unreachable. Switching to npmmirror."
-  npm config set registry https://registry.npmmirror.com
-fi
+server_alive() {
+  [ -f "$HOST_PID" ] && kill -0 "$(cat "$HOST_PID")" 2>/dev/null
+}
 
-ARCH="$(uname -m)"
-TARGET=""
-case "$ARCH" in
-  aarch64) TARGET="aarch64-linux-android30" ;;
-  armv7l|armv8l) TARGET="armv7a-linux-androideabi30" ;;
-  x86_64) TARGET="x86_64-linux-android30" ;;
-  i686) TARGET="i686-linux-android30" ;;
-  *) warn "Unknown architecture: $ARCH. Continuing without custom compiler target." ;;
+open_url() {
+  local url="$1"
+  if command -v termux-open-url >/dev/null 2>&1; then
+    termux-open-url "$url" || true
+  elif command -v am >/dev/null 2>&1; then
+    am start -a android.intent.action.VIEW -d "$url" >/dev/null 2>&1 || true
+  else
+    warn "Can't auto-open a browser. Open this manually: $url"
+  fi
+}
+
+host_stop() {
+  if server_alive; then
+    kill "$(cat "$HOST_PID")" 2>/dev/null || true
+  fi
+  pkill -f "$PKG_NAME" 2>/dev/null || true
+  rm -f "$HOST_PID"
+  command -v termux-wake-unlock >/dev/null 2>&1 && termux-wake-unlock || true
+  log "Stopped."
+}
+
+host_main() {
+  command -v pkg >/dev/null 2>&1 || die "This must run inside Termux. (Already in Debian/Ubuntu? Use --inside-setup / --inside-serve.)"
+
+  case "$(uname -m)" in
+    aarch64|arm64) ;;
+    *) warn "Unusual CPU architecture: $(uname -m). Continuing anyway." ;;
+  esac
+
+  # 1) Termux packages
+  local missing=()
+  for p in proot-distro termux-api curl; do
+    command -v "$p" >/dev/null 2>&1 || missing+=("$p")
+  done
+  # termux-api package provides termux-open-url etc.
+  if [ "${#missing[@]}" -gt 0 ]; then
+    log "Installing Termux packages: ${missing[*]}"
+    pkg update -y
+    pkg install -y "${missing[@]}"
+  fi
+
+  # 2) Distro
+  local rootfs="${PREFIX}/var/lib/proot-distro/installed-rootfs/${DISTRO}"
+  if [ ! -d "$rootfs" ]; then
+    log "Installing ${DISTRO} (one-time, a few hundred MB)..."
+    proot-distro install "$DISTRO"
+  fi
+
+  # 3) Keep CPU awake so Android doesn't kill the server
+  command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock || true
+
+  # 4) Setup inside distro (idempotent)
+  local self
+  self="$(readlink -f "$0")"
+  cp "$self" "${rootfs}/root/dsh.sh"
+  proot-distro login "$DISTRO" -- bash /root/dsh.sh --inside-setup
+
+  # 5) Start server (if not already running)
+  if server_alive; then
+    log "Server already running (pid $(cat "$HOST_PID"))."
+  else
+    : > "$HOST_LOG"
+    nohup proot-distro login "$DISTRO" -- bash /root/dsh.sh --inside-serve \
+      >"$HOST_LOG" 2>&1 &
+    echo $! > "$HOST_PID"
+  fi
+
+  # 6) Wait for the URL to show up in the log
+  log "Waiting for the server (first run downloads the package, can take a while)..."
+  local url="" i=0
+  while [ "$i" -lt "$WAIT_SECS" ]; do
+    url="$(find_url)"
+    [ -n "$url" ] && break
+    if ! server_alive; then
+      warn "Server exited early. Last log lines:"
+      tail -n 25 "$HOST_LOG" >&2 || true
+      exit 1
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+
+  if [ -z "$url" ]; then
+    warn "Server is running but no URL was found in the log within ${WAIT_SECS}s."
+    warn "Check: tail -n 40 $HOST_LOG"
+    exit 1
+  fi
+
+  log "Ready: $url"
+  open_url "$url"
+  log "Stop with: bash $(basename "$self") stop"
+}
+
+# ----------------------------------------------------------------------------
+case "${1:-}" in
+  --inside-setup) inner_setup ;;
+  --inside-serve) inner_serve ;;
+  stop)           host_stop ;;
+  logs)           tail -n 60 "$HOST_LOG" ;;
+  ""|start)       host_main ;;
+  *)              die "Unknown option: $1" ;;
 esac
-
-if [ -n "$TARGET" ]; then
-  export CFLAGS="-target $TARGET ${CFLAGS:-}"
-  export CXXFLAGS="-target $TARGET ${CXXFLAGS:-}"
-fi
-export SHARP_FORCE_GLOBAL_LIBVIPS=1
-export GYP_DEFINES="android_ndk_path="
-
-patch_node_gyp() {
-  local gypdir
-  gypdir="$(npm root -g)/npm/node_modules/node-gyp"
-  if [ -f "$gypdir/lib/create-config-gypi.js" ]; then
-    if ! grep -q 'process.platform === "android" ? "linux"' "$gypdir/lib/create-config-gypi.js"; then
-      cp "$gypdir/lib/create-config-gypi.js" "$gypdir/lib/create-config-gypi.js.bak.$$" 2>/dev/null || true
-      sed -i 's/OS: process.platform/OS: process.platform === "android" ? "linux" : process.platform/' \
-        "$gypdir/lib/create-config-gypi.js" 2>/dev/null || true
-    fi
-  fi
-}
-patch_node_gyp
-
-install_dsh() {
-  npm install -g @deepseek-ai/dsh --foreground-scripts
-}
-
-info "Installing @deepseek-ai/dsh..."
-if ! install_dsh; then
-  warn "First install attempt failed. Applying node-gyp compatibility patch and retrying..."
-  patch_node_gyp
-  install_dsh || fail "dsh installation failed after retry."
-fi
-ok "dsh installed."
-
-DSH_ROOT="$(npm root -g)/@deepseek-ai/dsh"
-[ -d "$DSH_ROOT" ] || fail "Cannot find dsh install directory: $DSH_ROOT"
-
-info "Patching dsh launcher for Termux..."
-DSH_BIN="$(command -v dsh 2>/dev/null || true)"
-if [ -n "$DSH_BIN" ]; then
-  REAL_BIN="$(readlink -f "$DSH_BIN" 2>/dev/null || echo "$DSH_BIN")"
-  if [ -f "$REAL_BIN" ] && head -n1 "$REAL_BIN" | grep -q '^#!'; then
-    if ! head -n1 "$REAL_BIN" | grep -q -- '--expose-internals'; then
-      cp "$REAL_BIN" "$REAL_BIN.bak.$$" 2>/dev/null || true
-      sed -i '1s|^#!.*|#!/usr/bin/env -S node --expose-internals|' "$REAL_BIN" 2>/dev/null || true
-    fi
-  fi
-fi
-
-info "Applying best-effort hardlink compatibility patch..."
-find "$DSH_ROOT" -type f \( -name '*.js' -o -name '*.cjs' -o -name '*.mjs' \) -print0 2>/dev/null | while IFS= read -r -d '' f; do
-  if grep -qE '\b(fs\.)?link\(' "$f" 2>/dev/null; then
-    cp "$f" "$f.bak.$$" 2>/dev/null || true
-    sed -i -E 's/\bfs\.link\(/fs.rename(/g; s/([^.[:alnum:]_])link\(/\1rename(/g' "$f" 2>/dev/null || true
-  fi
-done || true
-
-if ! NODE_PATH="$(npm root -g)" node -e "require('sharp')" >/dev/null 2>&1; then
-  warn "sharp native binding check failed. Trying WASM fallback..."
-  npm install -g @img/sharp-wasm32 >/dev/null 2>&1 || warn "WASM fallback install failed. Continuing."
-fi
-
-dsh --version >/dev/null 2>&1 || fail "dsh is installed but not runnable. Re-run this installer or check logs."
-ok "dsh version: $(dsh --version 2>/dev/null || echo unknown)"
-
-command -v termux-open-url >/dev/null 2>&1 || pkg install -y termux-tools >/dev/null 2>&1 || true
-
-info "Starting DeepSeek Harness web UI..."
-info "Opening http://127.0.0.1:3080 in your browser..."
-( sleep 3; termux-open-url http://127.0.0.1:3080 >/dev/null 2>&1 || true ) &
-info "Press Ctrl+C to stop."
-exec dsh web
-INSTALL_DSH
-)"
