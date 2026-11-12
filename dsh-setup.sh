@@ -3,6 +3,7 @@
 #
 # Usage (inside Termux):
 #   bash dsh-android.sh          # install what's missing, start server, open browser
+#   curl -fsSL <raw-url> | bash  # same thing, piped (stop: curl ... | bash -s -- stop)
 #   bash dsh-android.sh stop     # stop the server
 #   bash dsh-android.sh logs     # show server log
 #
@@ -130,25 +131,31 @@ host_main() {
   # termux-api package provides termux-open-url etc.
   if [ "${#missing[@]}" -gt 0 ]; then
     log "Installing Termux packages: ${missing[*]}"
-    pkg update -y
-    pkg install -y "${missing[@]}"
+    pkg update -y </dev/null
+    pkg install -y "${missing[@]}" </dev/null
   fi
 
   # 2) Distro
   local rootfs="${PREFIX}/var/lib/proot-distro/installed-rootfs/${DISTRO}"
   if [ ! -d "$rootfs" ]; then
     log "Installing ${DISTRO} (one-time, a few hundred MB)..."
-    proot-distro install "$DISTRO"
+    proot-distro install "$DISTRO" </dev/null
   fi
 
   # 3) Keep CPU awake so Android doesn't kill the server
   command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock || true
 
   # 4) Setup inside distro (idempotent)
-  local self
-  self="$(readlink -f "$0")"
-  cp "$self" "${rootfs}/root/dsh.sh"
-  proot-distro login "$DISTRO" -- bash /root/dsh.sh --inside-setup
+  # Build the guest-side script from our own functions, so this also works
+  # when piped (curl ... | bash), where $0 is not a real file.
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set -euo pipefail'
+    declare -p DISTRO NODE_MAJOR MIN_NODE_MAJOR PKG_NAME WAIT_SECS
+    declare -f log warn die inner_setup inner_serve
+    echo 'case "${1:-}" in --inside-setup) inner_setup ;; --inside-serve) inner_serve ;; esac'
+  } > "${rootfs}/root/dsh.sh"
+  proot-distro login "$DISTRO" -- bash /root/dsh.sh --inside-setup </dev/null
 
   # 5) Start server (if not already running)
   if server_alive; then
@@ -156,7 +163,7 @@ host_main() {
   else
     : > "$HOST_LOG"
     nohup proot-distro login "$DISTRO" -- bash /root/dsh.sh --inside-serve \
-      >"$HOST_LOG" 2>&1 &
+      </dev/null >"$HOST_LOG" 2>&1 &
     echo $! > "$HOST_PID"
   fi
 
@@ -183,7 +190,7 @@ host_main() {
 
   log "Ready: $url"
   open_url "$url"
-  log "Stop with: bash $(basename "$self") stop"
+  log "Stop with: bash <this script> stop"
 }
 
 # ----------------------------------------------------------------------------
