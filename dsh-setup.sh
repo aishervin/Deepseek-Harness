@@ -26,9 +26,9 @@ pkg update -y
 pkg upgrade -y
 
 info "Installing system dependencies..."
-pkg install -y nodejs-lts git curl wget build-essential clang cmake ninja python pkg-config binutils libvips libandroid-spawn proot which || {
+pkg install -y nodejs-lts git curl wget build-essential clang cmake ninja python pkg-config binutils libvips libandroid-spawn proot which termux-tools || {
   warn "nodejs-lts was not available. Falling back to nodejs..."
-  pkg install -y nodejs git curl wget build-essential clang cmake ninja python pkg-config binutils libvips libandroid-spawn proot which
+  pkg install -y nodejs git curl wget build-essential clang cmake ninja python pkg-config binutils libvips libandroid-spawn proot which termux-tools
 }
 
 command -v node >/dev/null 2>&1 || fail "Node.js installation failed."
@@ -117,8 +117,11 @@ fi
 dsh --version >/dev/null 2>&1 || fail "dsh is installed but not runnable. Re-run this installer or check logs."
 ok "dsh version: $(dsh --version 2>/dev/null || echo unknown)"
 
+command -v termux-open-url >/dev/null 2>&1 || pkg install -y termux-tools >/dev/null 2>&1 || true
+
 info "Starting DeepSeek Harness web UI..."
-info "Open http://127.0.0.1:3080 in your browser."
+info "Opening http://127.0.0.1:3080 in your browser..."
+( sleep 3; termux-open-url http://127.0.0.1:3080 >/dev/null 2>&1 || true ) &
 info "Press Ctrl+C to stop."
 exec dsh web
 INSTALL_DSH
