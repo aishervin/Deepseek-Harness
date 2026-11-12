@@ -136,10 +136,13 @@ host_main() {
   fi
 
   # 2) Distro
-  local rootfs="${PREFIX}/var/lib/proot-distro/installed-rootfs/${DISTRO}"
-  if [ ! -d "$rootfs" ]; then
+  # Detect by actually trying to enter it: the on-disk layout differs between
+  # proot-distro versions, so checking a directory path is unreliable.
+  if ! proot-distro login "$DISTRO" -- true </dev/null >/dev/null 2>&1; then
     log "Installing ${DISTRO} (one-time, a few hundred MB)..."
     proot-distro install "$DISTRO" </dev/null
+  else
+    log "${DISTRO} already installed."
   fi
 
   # 3) Keep CPU awake so Android doesn't kill the server
@@ -148,22 +151,26 @@ host_main() {
   # 4) Setup inside distro (idempotent)
   # Build the guest-side script from our own functions, so this also works
   # when piped (curl ... | bash), where $0 is not a real file.
+  # The guest script is fed through stdin (bash -s), so we never need to know
+  # where proot-distro keeps the rootfs.
+  local guest="${TMPDIR:-$PREFIX/tmp}/dsh-guest.sh"
+  mkdir -p "$(dirname "$guest")"
   {
     echo '#!/usr/bin/env bash'
     echo 'set -euo pipefail'
     declare -p DISTRO NODE_MAJOR MIN_NODE_MAJOR PKG_NAME WAIT_SECS
     declare -f log warn die inner_setup inner_serve
     echo 'case "${1:-}" in --inside-setup) inner_setup ;; --inside-serve) inner_serve ;; esac'
-  } > "${rootfs}/root/dsh.sh"
-  proot-distro login "$DISTRO" -- bash /root/dsh.sh --inside-setup </dev/null
+  } > "$guest"
+  proot-distro login "$DISTRO" -- bash -s -- --inside-setup < "$guest"
 
   # 5) Start server (if not already running)
   if server_alive; then
     log "Server already running (pid $(cat "$HOST_PID"))."
   else
     : > "$HOST_LOG"
-    nohup proot-distro login "$DISTRO" -- bash /root/dsh.sh --inside-serve \
-      </dev/null >"$HOST_LOG" 2>&1 &
+    nohup proot-distro login "$DISTRO" -- bash -s -- --inside-serve \
+      <"$guest" >"$HOST_LOG" 2>&1 &
     echo $! > "$HOST_PID"
   fi
 
